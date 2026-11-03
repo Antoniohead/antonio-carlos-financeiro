@@ -1,0 +1,1231 @@
+import streamlit as st
+import pandas as pd
+from datetime import datetime
+import os
+import io
+import json
+import math
+import urllib.parse
+from supabase import create_client, Client
+
+# ReportLab para geração de PDFs
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image as RLImage
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
+
+# --- CONFIGURAÇÃO E PERSISTÊNCIA VIA SUPABASE ---
+@st.cache_resource
+def init_supabase() -> Client:
+    url = st.secrets["SUPABASE_URL"].strip().rstrip("/")
+    key = st.secrets["SUPABASE_KEY"].strip()
+    return create_client(url, key)
+
+try:
+    supabase = init_supabase()
+except Exception as e:
+    st.error("⚠️ Erro de conexão com o Supabase. Verifique se configurou as chaves nos Secrets do Streamlit Cloud.")
+    st.stop()
+
+def parse_json_safely(val):
+    if not val:
+        return []
+    if isinstance(val, list):
+        return val
+    try:
+        data = json.loads(val)
+        return data if isinstance(data, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+def limpar_valor_json(obj):
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return 0.0
+        return obj
+    elif isinstance(obj, dict):
+        return {k: limpar_valor_json(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return [limpar_valor_json(i) for i in obj]
+    return obj
+
+def serializar_para_jsonb(dados):
+    if isinstance(dados, pd.DataFrame):
+        dados = dados.to_dict('records')
+    if isinstance(dados, (list, dict)):
+        return limpar_valor_json(dados)
+    return []
+
+def safe_float(val):
+    try:
+        f = float(val)
+        if math.isnan(f) or math.isinf(f):
+            return 0.0
+        return f
+    except (ValueError, TypeError):
+        return 0.0
+
+# Formata valores para o padrão monetário brasileiro (R$ X.XXX,YY)
+def fmt_br(val):
+    v = safe_float(val)
+    s = f"{v:,.2f}"
+    return f"R$ {s.replace(',', 'X').replace('.', ',').replace('X', '.')}"
+
+def carregar_eventos():
+    try:
+        response = supabase.table("eventos").select("*").execute()
+        rows = response.data or []
+    except Exception as e:
+        st.error(f"Erro ao carregar dados do Supabase: {e}")
+        rows = []
+
+    eventos = []
+    for d in rows:
+        fat_bruto = safe_float(d.get("faturamento_bruto"))
+        imp_nf = safe_float(d.get("imposto_nf"))
+        custos_tot = safe_float(d.get("custos_total"))
+        lucro = safe_float(d.get("lucro_real")) if d.get("lucro_real") is not None else (fat_bruto - imp_nf - custos_tot)
+
+        forn_ext_list = parse_json_safely(d.get("fornecedores_externos"))
+        if not forn_ext_list and (d.get("custo_fornecedor_externo") or d.get("desc_fornecedor_externo")):
+            c_val = safe_float(d.get("custo_fornecedor_externo"))
+            d_desc = d.get("desc_fornecedor_externo") or "Fornecedor Externo"
+            if c_val > 0 or d_desc:
+                forn_ext_list = [{"Descrição": d_desc, "Valor": c_val}]
+
+        reembolsos_list = parse_json_safely(d.get("reembolsos"))
+        hist_rec_list = parse_json_safely(d.get("historico_recebimentos"))
+        hist_pag_list = parse_json_safely(d.get("historico_pagamentos"))
+
+        val_recebido_calc = sum(safe_float(r.get("Valor", 0.0)) for r in hist_rec_list)
+        val_pago_calc = sum(safe_float(p.get("Valor", 0.0)) for p in hist_pag_list)
+
+        val_rec_final = val_recebido_calc if hist_rec_list else safe_float(d.get("val_recebido_cliente"))
+        val_pago_final = val_pago_calc if hist_pag_list else safe_float(d.get("val_pago_equipe"))
+
+        custo_reembolsos_total = sum(safe_float(r.get("Valor", 0.0)) for r in reembolsos_list)
+        custo_forn_total = sum(safe_float(f.get("Valor", 0.0)) for f in forn_ext_list)
+
+        falta_rec = fat_bruto - val_rec_final
+        falta_pag = custos_tot - val_pago_final
+
+        if val_rec_final >= fat_bruto and fat_bruto > 0:
+            st_rec = "Pago Total"
+        elif val_rec_final > 0:
+            st_rec = f"Parcial (Falta {fmt_br(falta_rec)})"
+        else:
+            st_rec = "Pendente"
+
+        if val_pago_final >= custos_tot and custos_tot > 0:
+            st_pag = "Pago Total"
+        elif val_pago_final > 0:
+            st_pag = f"Parcial (Falta {fmt_br(falta_pag)})"
+        else:
+            st_pag = "Pendente"
+
+        eventos.append({
+            "id": d.get("id"),
+            "Cliente": d.get("cliente") or "Não informado",
+            "Data Evento": d.get("data_evento") or "",
+            "Horário": d.get("horario") or "",
+            "Data Montagem": d.get("data_montagem") or "",
+            "Horário Montagem": d.get("horario_montagem") or "",
+            "Complexo / Local": d.get("complexo") or "",
+            "Aprovado": safe_float(d.get("aprovado")),
+            "Val. Extra": safe_float(d.get("val_extra")),
+            "Itens Extras": parse_json_safely(d.get("itens_extras")),
+            "Faturamento Bruto": fat_bruto,
+            "10% NF": imp_nf,
+            "Responsável Imposto": d.get("responsavel_imposto") or "Incluso no Valor",
+            "Custos Operacionais + Logística": custos_tot,
+            "Custo Resolume": safe_float(d.get("custo_resolume")),
+            "Custo Iluminação": safe_float(d.get("custo_iluminacao")),
+            "Custo Sonorização": safe_float(d.get("custo_sonorizacao")),
+            "Custo Diretor": safe_float(d.get("custo_diretor")),
+            "Custo Logística": safe_float(d.get("custo_logistica")),
+            "Fornecedores Externos": forn_ext_list,
+            "Custo Fornecedor Externo": custo_forn_total,
+            "Desc. Fornecedor Externo": ", ".join([str(f.get("Descrição", "")) for f in forn_ext_list]),
+            "Reembolsos": reembolsos_list,
+            "Custo Reembolsos": custo_reembolsos_total,
+            "Historico Recebimentos": hist_rec_list,
+            "Historico Pagamentos": hist_pag_list,
+            "Valor Recebido Cliente": val_rec_final,
+            "Valor Pago Equipe": val_pago_final,
+            "Status Recebimento": st_rec,
+            "Status Pagamento": st_pag,
+            "Status": d.get("status") or "Pendente",
+            "Numero NF": d.get("numero_nf") or "",
+            "Valor NF": safe_float(d.get("valor_nf")),
+            "Lucro Real": lucro,
+            "Pag. Operacional": d.get("pag_operacional") or "",
+            "Rec. Champions": d.get("rec_champions") or "",
+            "Equipamentos": d.get("equipamentos") or "",
+            "Equipe Técnica": d.get("equipe_tecnica") or "",
+            "Observações": d.get("observacoes") or ""
+        })
+
+    def extrair_data_obj(item):
+        dt_str = item.get("Data Evento", "")
+        try:
+            return datetime.strptime(dt_str, "%d/%m/%Y")
+        except (ValueError, TypeError):
+            return datetime.min
+
+    eventos.sort(key=extrair_data_obj, reverse=True)
+    return eventos
+
+def salvar_evento_db(reg):
+    payload = {
+        "cliente": str(reg.get("Cliente") or "Não informado"),
+        "data_evento": str(reg.get("Data Evento") or ""),
+        "horario": str(reg.get("Horário") or ""),
+        "data_montagem": str(reg.get("Data Montagem") or ""),
+        "horario_montagem": str(reg.get("Horário Montagem") or ""),
+        "complexo": str(reg.get("Complexo / Local") or ""),
+        "aprovado": safe_float(reg.get("Aprovado")),
+        "val_extra": safe_float(reg.get("Val. Extra")),
+        "itens_extras": serializar_para_jsonb(reg.get("Itens Extras")),
+        "faturamento_bruto": safe_float(reg.get("Faturamento Bruto")),
+        "imposto_nf": safe_float(reg.get("10% NF")),
+        "responsavel_imposto": str(reg.get("Responsável Imposto") or "Incluso no Valor"),
+        "custos_total": safe_float(reg.get("Custos Operacionais + Logística")),
+        "custo_resolume": safe_float(reg.get("Custo Resolume")),
+        "custo_iluminacao": safe_float(reg.get("Custo Iluminação")),
+        "custo_sonorizacao": safe_float(reg.get("Custo Sonorização")),
+        "custo_diretor": safe_float(reg.get("Custo Diretor")),
+        "custo_logistica": safe_float(reg.get("Custo Logística")),
+        "custo_fornecedor_externo": safe_float(reg.get("Custo Fornecedor Externo")),
+        "desc_fornecedor_externo": str(reg.get("Desc. Fornecedor Externo") or ""),
+        "fornecedores_externos": serializar_para_jsonb(reg.get("Fornecedores Externos")),
+        "reembolsos": serializar_para_jsonb(reg.get("Reembolsos")),
+        "historico_recebimentos": serializar_para_jsonb(reg.get("Historico Recebimentos")),
+        "historico_pagamentos": serializar_para_jsonb(reg.get("Historico Pagamentos")),
+        "custo_reembolsos": safe_float(reg.get("Custo Reembolsos")),
+        "val_recebido_cliente": safe_float(reg.get("Valor Recebido Cliente")),
+        "val_pago_equipe": safe_float(reg.get("Valor Pago Equipe")),
+        "status_recebimento": str(reg.get("Status Recebimento") or "Pendente"),
+        "status_pagamento": str(reg.get("Status Pagamento") or "Pendente"),
+        "status": str(reg.get("Status") or "Pendente"),
+        "numero_nf": str(reg.get("Numero NF") or ""),
+        "valor_nf": safe_float(reg.get("Valor NF")),
+        "lucro_real": safe_float(reg.get("Lucro Real")),
+        "lucro_miguel": 0.0,
+        "lucro_antonio": safe_float(reg.get("Lucro Real")),
+        "pag_operacional": str(reg.get("Pag. Operacional") or ""),
+        "rec_champions": str(reg.get("Rec. Champions") or ""),
+        "equipamentos": str(reg.get("Equipamentos") or ""),
+        "equipe_tecnica": str(reg.get("Equipe Técnica") or ""),
+        "observacoes": str(reg.get("Observações") or "")
+    }
+    supabase.table("eventos").insert(payload).execute()
+
+def atualizar_evento_db(id_evento, reg):
+    payload = {
+        "cliente": str(reg.get("Cliente") or "Não informado"),
+        "data_evento": str(reg.get("Data Evento") or ""),
+        "horario": str(reg.get("Horário") or ""),
+        "data_montagem": str(reg.get("Data Montagem") or ""),
+        "horario_montagem": str(reg.get("Horário Montagem") or ""),
+        "complexo": str(reg.get("Complexo / Local") or ""),
+        "aprovado": safe_float(reg.get("Aprovado")),
+        "val_extra": safe_float(reg.get("Val. Extra")),
+        "itens_extras": serializar_para_jsonb(reg.get("Itens Extras")),
+        "faturamento_bruto": safe_float(reg.get("Faturamento Bruto")),
+        "imposto_nf": safe_float(reg.get("10% NF")),
+        "responsavel_imposto": str(reg.get("Responsável Imposto") or "Incluso no Valor"),
+        "custos_total": safe_float(reg.get("Custos Operacionais + Logística")),
+        "custo_resolume": safe_float(reg.get("Custo Resolume")),
+        "custo_iluminacao": safe_float(reg.get("Custo Iluminação")),
+        "custo_sonorizacao": safe_float(reg.get("Custo Sonorização")),
+        "custo_diretor": safe_float(reg.get("Custo Diretor")),
+        "custo_logistica": safe_float(reg.get("Custo Logística")),
+        "custo_fornecedor_externo": safe_float(reg.get("Custo Fornecedor Externo")),
+        "desc_fornecedor_externo": str(reg.get("Desc. Fornecedor Externo") or ""),
+        "fornecedores_externos": serializar_para_jsonb(reg.get("Fornecedores Externos")),
+        "reembolsos": serializar_para_jsonb(reg.get("Reembolsos")),
+        "historico_recebimentos": serializar_para_jsonb(reg.get("Historico Recebimentos")),
+        "historico_pagamentos": serializar_para_jsonb(reg.get("Historico Pagamentos")),
+        "custo_reembolsos": safe_float(reg.get("Custo Reembolsos")),
+        "val_recebido_cliente": safe_float(reg.get("Valor Recebido Cliente")),
+        "val_pago_equipe": safe_float(reg.get("Valor Pago Equipe")),
+        "status_recebimento": str(reg.get("Status Recebimento") or "Pendente"),
+        "status_pagamento": str(reg.get("Status Pagamento") or "Pendente"),
+        "status": str(reg.get("Status") or "Pendente"),
+        "numero_nf": str(reg.get("Numero NF") or ""),
+        "valor_nf": safe_float(reg.get("Valor NF")),
+        "lucro_real": safe_float(reg.get("Lucro Real")),
+        "lucro_miguel": 0.0,
+        "lucro_antonio": safe_float(reg.get("Lucro Real")),
+        "pag_operacional": str(reg.get("Pag. Operacional") or ""),
+        "rec_champions": str(reg.get("Rec. Champions") or ""),
+        "equipamentos": str(reg.get("Equipamentos") or ""),
+        "equipe_tecnica": str(reg.get("Equipe Técnica") or ""),
+        "observacoes": str(reg.get("Observações") or "")
+    }
+    supabase.table("eventos").update(payload).eq("id", id_evento).execute()
+
+def deletar_evento_db(id_evento):
+    supabase.table("eventos").delete().eq("id", id_evento).execute()
+
+def gerar_excel_backup(eventos):
+    df_export = pd.DataFrame(eventos)
+    df_export["Itens Extras (Texto)"] = df_export["Itens Extras"].apply(lambda x: json.dumps(x, ensure_ascii=False))
+    df_export["Fornecedores Externos (Texto)"] = df_export["Fornecedores Externos"].apply(lambda x: json.dumps(x, ensure_ascii=False))
+    df_export["Reembolsos (Texto)"] = df_export["Reembolsos"].apply(lambda x: json.dumps(x, ensure_ascii=False))
+    
+    cols_drop = ["Itens Extras", "Fornecedores Externos", "Reembolsos"]
+    df_export_clean = df_export.drop(columns=[c for c in cols_drop if c in df_export.columns])
+    
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='openpyxl') as writer:
+        df_export_clean.to_excel(writer, index=False, sheet_name='Eventos_Backup')
+    output.seek(0)
+    return output
+
+# GERADOR DE RECIBO DE PAGAMENTO / CACHÊ / REEMBOLSO
+def gerar_pdf_recibo(favorecido, valor, servico_desc, cliente, data_evento):
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=30, leftMargin=30, topMargin=30, bottomMargin=30)
+    story = []
+    styles = getSampleStyleSheet()
+    
+    title_style = ParagraphStyle('RTitle', parent=styles['Heading1'], fontName='Helvetica-Bold', fontSize=16, textColor=colors.HexColor("#D8B4FE"), alignment=1)
+    body_style = ParagraphStyle('RBody', parent=styles['Normal'], fontName='Helvetica', fontSize=10, textColor=colors.HexColor("#FAF6EE"), leading=14)
+    
+    if os.path.exists("logo.jpg"):
+        story.append(RLImage("logo.jpg", width=500, height=110))
+        story.append(Spacer(1, 15))
+    elif os.path.exists("logo.png"):
+        story.append(RLImage("logo.png", width=500, height=110))
+        story.append(Spacer(1, 15))
+        
+    story.append(Paragraph("<b>RECIBO DE PAGAMENTO / RESSARCIMENTO</b>", title_style))
+    story.append(Spacer(1, 20))
+    
+    val_box = Table([[Paragraph(f"<b>VALOR TOTAL: {fmt_br(valor)}</b>", ParagraphStyle('VBox', parent=title_style, fontSize=14, textColor=colors.HexColor("#FF77FF")))]], colWidths=[520])
+    val_box.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,-1), colors.HexColor("#1A1025")), ('BOX', (0,0), (-1,-1), 1, colors.HexColor("#D8B4FE")), ('PADDING', (0,0), (-1,-1), 10), ('ALIGN', (0,0), (-1,-1), 'CENTER')]))
+    story.append(val_box)
+    story.append(Spacer(1, 20))
+    
+    texto_recibo = f"""
+    Recebi(emos) de <b>ANTONIO CARLOS</b> a quantia de <b>{fmt_br(valor)}</b>, referente ao pagamento por serviços prestados ou reembolso de despesas operacionais referentes ao evento do cliente <b>{cliente}</b> realizado na data de <b>{data_evento}</b>.
+    <br/><br/>
+    <b>Descrição dos Serviços / Reembolso:</b><br/>
+    {servico_desc}
+    """
+    story.append(Paragraph(texto_recibo, body_style))
+    story.append(Spacer(1, 40))
+    
+    data_atual = datetime.now().strftime("%d de %B de %Y")
+    story.append(Paragraph(f"São Paulo, {data_atual}.", body_style))
+    story.append(Spacer(1, 50))
+    
+    t_ass = Table([
+        [Paragraph("__________________________________________", body_style), Paragraph("__________________________________________", body_style)],
+        [Paragraph(f"<b>{favorecido}</b><br/>Favorecido / Recebedor", body_style), Paragraph("<b>ANTONIO CARLOS</b><br/>Emissor / Aprovador", body_style)]
+    ], colWidths=[260, 260])
+    t_ass.setStyle(TableStyle([('ALIGN', (0,0), (-1,-1), 'CENTER')]))
+    story.append(t_ass)
+    
+    doc.build(story)
+    buffer.seek(0)
+    return buffer
+
+# GERADOR DE PDF DUAL DE ORÇAMENTO E CONTROLE
+def gerar_pdf_evento(registro, tipo_documento="ORCAMENTO"):
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter, rightMargin=25, leftMargin=25, topMargin=25, bottomMargin=25)
+    story = []
+    styles = getSampleStyleSheet()
+    
+    sec_title_style = ParagraphStyle('SecTitle', parent=styles['Heading2'], fontName='Helvetica-Bold', fontSize=10, textColor=colors.white, spaceAfter=0)
+    th_style = ParagraphStyle('TH', parent=styles['Normal'], fontName='Helvetica-Bold', fontSize=8, textColor=colors.HexColor("#1A1025"))
+    td_style = ParagraphStyle('TD', parent=styles['Normal'], fontName='Helvetica', fontSize=8, textColor=colors.HexColor("#1A1025"))
+    td_bold = ParagraphStyle('TDBold', parent=styles['Normal'], fontName='Helvetica-Bold', fontSize=8, textColor=colors.HexColor("#1A1025"))
+    td_status = ParagraphStyle('TDStatus', parent=styles['Normal'], fontName='Helvetica-Bold', fontSize=8, textColor=colors.HexColor("#00C853"), alignment=1)
+    val_title_style = ParagraphStyle('ValTitle', parent=styles['Normal'], fontName='Helvetica-Bold', fontSize=10, textColor=colors.white)
+    val_num_style = ParagraphStyle('ValNum', parent=styles['Normal'], fontName='Helvetica-Bold', fontSize=12, textColor=colors.HexColor("#FF77FF"), alignment=2)
+    nota_text_style = ParagraphStyle('NotaText', parent=styles['Normal'], fontName='Helvetica', fontSize=7, textColor=colors.HexColor("#2A1E35"), leading=9)
+
+    if os.path.exists("logo.jpg"):
+        story.append(RLImage("logo.jpg", width=560, height=130))
+        story.append(Spacer(1, 10))
+    elif os.path.exists("logo.png"):
+        story.append(RLImage("logo.png", width=560, height=130))
+        story.append(Spacer(1, 10))
+
+    titulo_sec1 = "📌 ORÇAMENTO COMERCIAL E ESCOPO TÉCNICO" if tipo_documento == "ORCAMENTO" else "📌 RELATÓRIO DE CONTROLE FINANCEIRO INTERNO"
+    sec1_hdr = Table([[Paragraph(titulo_sec1, sec_title_style)]], colWidths=[560])
+    sec1_hdr.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,-1), colors.HexColor("#3B1B54")), ('PADDING', (0,0), (-1,-1), 6)]))
+    story.append(sec1_hdr)
+    
+    dt_montagem_str = f"{registro.get('Data Montagem', '')} {registro.get('Horário Montagem', '')}".strip()
+    if not dt_montagem_str:
+        dt_montagem_str = "Não informada"
+
+    if tipo_documento == "ORCAMENTO":
+        dados_sec1 = [
+            [Paragraph("CLIENTE / EMPRESA", th_style), Paragraph(str(registro["Cliente"]), td_bold), Paragraph("DATA DO EVENTO", th_style), Paragraph(f"{registro['Data Evento']} ({registro['Horário']})", td_style)],
+            [Paragraph("LOCAL / ESPAÇO", th_style), Paragraph(str(registro["Complexo / Local"]), td_style), Paragraph("DATA MONTAGEM", th_style), Paragraph(dt_montagem_str, td_style)],
+            [Paragraph("OBSERVAÇÕES", th_style), Paragraph(str(registro["Observações"]), td_style), Paragraph("", th_style), Paragraph("", th_style)]
+        ]
+    else:
+        dados_sec1 = [
+            [Paragraph("CLIENTE / EMPRESA", th_style), Paragraph(str(registro["Cliente"]), td_bold), Paragraph("DATA DO EVENTO", th_style), Paragraph(f"{registro['Data Evento']} ({registro['Horário']})", td_style)],
+            [Paragraph("LOCAL / ESPAÇO", th_style), Paragraph(str(registro["Complexo / Local"]), td_style), Paragraph("DATA MONTAGEM", th_style), Paragraph(dt_montagem_str, td_style)],
+            [Paragraph("EQUIPE ESCALADA", th_style), Paragraph(str(registro["Equipe Técnica"]).replace('\n', '<br/>'), td_style), Paragraph("OBSERVAÇÕES", th_style), Paragraph(str(registro["Observações"]), td_style)]
+        ]
+
+    t1 = Table(dados_sec1, colWidths=[110, 170, 110, 170])
+    t1.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,-1), colors.HexColor("#F3E8FF")), ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor("#D8B4FE")), ('PADDING', (0,0), (-1,-1), 5)]))
+    story.append(t1)
+    story.append(Spacer(1, 10))
+
+    sec2_hdr = Table([[Paragraph("🛠️ SETOR DE ENGENHARIA DE ÁUDIO, LUZ, VÍDEO & ESTRUTURA", sec_title_style)]], colWidths=[560])
+    sec2_hdr.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,-1), colors.HexColor("#3B1B54")), ('PADDING', (0,0), (-1,-1), 6)]))
+    story.append(sec2_hdr)
+    t2 = Table([[Paragraph("ITEM / ATIVO TÉCNICO CONTRATADO", th_style), Paragraph("STATUS OPERACIONAL", th_style)], [Paragraph(str(registro["Equipamentos"]).replace('\n', '<br/>'), td_style), Paragraph("INCLUSO", td_status)]], colWidths=[440, 120])
+    t2.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,0), colors.HexColor("#E9D5FF")), ('BACKGROUND', (0,1), (-1,-1), colors.HexColor("#F3E8FF")), ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor("#D8B4FE")), ('PADDING', (0,0), (-1,-1), 6), ('VALIGN', (0,0), (-1,-1), 'MIDDLE')]))
+    story.append(t2)
+    story.append(Spacer(1, 10))
+
+    val_base = safe_float(registro.get("Aprovado", 0.0))
+    val_extra_tot = safe_float(registro.get("Val. Extra", 0.0))
+    val_imposto = safe_float(registro.get("10% NF", 0.0))
+    resp_imposto = registro.get("Responsável Imposto", "Incluso no Valor")
+    itens_extras = registro.get("Itens Extras", [])
+
+    if tipo_documento == "ORCAMENTO":
+        sec_or_hdr = Table([[Paragraph("💵 RESUMO DE VALORES (ESCOPO BASE + ADICIONAIS)", sec_title_style)]], colWidths=[560])
+        sec_or_hdr.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,-1), colors.HexColor("#3B1B54")), ('PADDING', (0,0), (-1,-1), 6)]))
+        story.append(sec_or_hdr)
+
+        dados_orc_resumo = [
+            [Paragraph("ESCOPO BASE APROVADO", th_style), Paragraph("STATUS / DESCRIÇÃO", th_style), Paragraph("VALOR BASE (R$)", th_style)],
+            [Paragraph("Estrutura, Equipamentos e Serviço Base", td_style), Paragraph("Pacote Padrão Aprovado", td_style), Paragraph(fmt_br(val_base), td_bold)]
+        ]
+
+        if itens_extras and len(itens_extras) > 0:
+            for item in itens_extras:
+                desc = item.get("Descrição") or item.get("Descricao") or "Item Extra"
+                val = safe_float(item.get("Valor", 0.0))
+                dados_orc_resumo.append([
+                    Paragraph(f"➕ Extra: {desc}", td_style),
+                    Paragraph("Item Solicitado Adicionalmente", td_style),
+                    Paragraph(fmt_br(val), td_bold)
+                ])
+
+            dados_orc_resumo.append([
+                Paragraph("<b>SUBTOTAL DE ADICIONAIS / EXTRAS</b>", th_style),
+                Paragraph("", th_style),
+                Paragraph(f"<b>{fmt_br(val_extra_tot)}</b>", td_bold)
+            ])
+
+        if resp_imposto == "Por Conta do Cliente":
+            dados_orc_resumo.append([
+                Paragraph("<b>IMPOSTOS E ENCARGOS FISCAIS (10% NF)</b>", th_style),
+                Paragraph("Por conta do Cliente / Adicionado ao Total", td_style),
+                Paragraph(f"<b>{fmt_br(val_imposto)}</b>", td_bold)
+            ])
+
+        t_orc_resumo = Table(dados_orc_resumo, colWidths=[240, 180, 140])
+        t_orc_resumo.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#E9D5FF")),
+            ('BACKGROUND', (0,1), (-1,-1), colors.HexColor("#F3E8FF")),
+            ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor("#D8B4FE")),
+            ('PADDING', (0,0), (-1,-1), 5),
+            ('VALIGN', (0,0), (-1,-1), 'MIDDLE')
+        ]))
+        story.append(t_orc_resumo)
+        story.append(Spacer(1, 10))
+
+    if tipo_documento == "FINANCEIRO":
+        if itens_extras and len(itens_extras) > 0:
+            sec_ext_hdr = Table([[Paragraph("➕ ITENS E SERVIÇOS ADICIONAIS (EXTRAS)", sec_title_style)]], colWidths=[560])
+            sec_ext_hdr.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,-1), colors.HexColor("#3B1B54")), ('PADDING', (0,0), (-1,-1), 6)]))
+            story.append(sec_ext_hdr)
+
+            dados_extras = [[Paragraph("DESCRIÇÃO DO ITEM EXTRA", th_style), Paragraph("VALOR (R$)", th_style)]]
+            for item in itens_extras:
+                desc = item.get("Descrição") or item.get("Descricao") or "Item Extra"
+                val = safe_float(item.get("Valor", 0.0))
+                dados_extras.append([Paragraph(str(desc), td_style), Paragraph(fmt_br(val), td_bold)])
+
+            t_extras = Table(dados_extras, colWidths=[420, 140])
+            t_extras.setStyle(TableStyle([
+                ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#E9D5FF")),
+                ('BACKGROUND', (0,1), (-1,-1), colors.HexColor("#F3E8FF")),
+                ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor("#D8B4FE")),
+                ('PADDING', (0,0), (-1,-1), 5), ('VALIGN', (0,0), (-1,-1), 'MIDDLE')
+            ]))
+            story.append(t_extras)
+            story.append(Spacer(1, 10))
+
+        fornecedores_list = registro.get("Fornecedores Externos", [])
+        if fornecedores_list:
+            sec_forn_hdr = Table([[Paragraph("🌐 FORNECEDORES EXTERNOS CONTRATADOS", sec_title_style)]], colWidths=[560])
+            sec_forn_hdr.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,-1), colors.HexColor("#3B1B54")), ('PADDING', (0,0), (-1,-1), 6)]))
+            story.append(sec_forn_hdr)
+
+            dados_forn = [[Paragraph("SERVIÇO / FORNECEDOR", th_style), Paragraph("CUSTO (R$)", th_style)]]
+            for f_item in fornecedores_list:
+                f_desc = f_item.get("Descrição") or "Fornecedor Externo"
+                f_val = safe_float(f_item.get("Valor", 0.0))
+                dados_forn.append([Paragraph(str(f_desc), td_style), Paragraph(fmt_br(f_val), td_bold)])
+
+            t_forn = Table(dados_forn, colWidths=[420, 140])
+            t_forn.setStyle(TableStyle([
+                ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#E9D5FF")),
+                ('BACKGROUND', (0,1), (-1,-1), colors.HexColor("#F3E8FF")),
+                ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor("#D8B4FE")),
+                ('PADDING', (0,0), (-1,-1), 5), ('VALIGN', (0,0), (-1,-1), 'MIDDLE')
+            ]))
+            story.append(t_forn)
+            story.append(Spacer(1, 10))
+
+        reembolsos_pdf_list = registro.get("Reembolsos", [])
+        if reembolsos_pdf_list:
+            sec_reemb_hdr = Table([[Paragraph("💸 DESPESAS E REEMBOLSOS LANÇADOS", sec_title_style)]], colWidths=[560])
+            sec_reemb_hdr.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,-1), colors.HexColor("#3B1B54")), ('PADDING', (0,0), (-1,-1), 6)]))
+            story.append(sec_reemb_hdr)
+
+            dados_reemb = [[Paragraph("FAVORECIDO", th_style), Paragraph("DESCRIÇÃO / COMPROVANTE", th_style), Paragraph("VALOR (R$)", th_style)]]
+            for r_item in reembolsos_pdf_list:
+                r_fav = r_item.get("Favorecido") or "Não informado"
+                r_desc = r_item.get("Descrição / Comprovante") or r_item.get("Descrição") or "Reembolso"
+                r_val = safe_float(r_item.get("Valor", 0.0))
+                dados_reemb.append([Paragraph(str(r_fav), td_style), Paragraph(str(r_desc), td_style), Paragraph(fmt_br(r_val), td_bold)])
+
+            t_reemb = Table(dados_reemb, colWidths=[160, 260, 140])
+            t_reemb.setStyle(TableStyle([
+                ('BACKGROUND', (0,0), (-1,0), colors.HexColor("#E9D5FF")),
+                ('BACKGROUND', (0,1), (-1,-1), colors.HexColor("#F3E8FF")),
+                ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor("#D8B4FE")),
+                ('PADDING', (0,0), (-1,-1), 5), ('VALIGN', (0,0), (-1,-1), 'MIDDLE')
+            ]))
+            story.append(t_reemb)
+            story.append(Spacer(1, 10))
+
+        sec4_hdr = Table([[Paragraph("💰 BALANÇO FINANCEIRO & LUCRO LÍQUIDO", sec_title_style)]], colWidths=[560])
+        sec4_hdr.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,-1), colors.HexColor("#3B1B54")), ('PADDING', (0,0), (-1,-1), 6)]))
+        story.append(sec4_hdr)
+        
+        dados_sec4 = [
+            [Paragraph("Faturamento Bruto:", th_style), Paragraph(fmt_br(registro['Faturamento Bruto']), td_bold), Paragraph(f"Imposto NF ({resp_imposto}):", th_style), Paragraph(fmt_br(registro['10% NF']), td_style)],
+            [Paragraph("Custos Operacionais Totais:", th_style), Paragraph(fmt_br(registro['Custos Operacionais + Logística']), td_style), Paragraph("Total Reembolsos:", th_style), Paragraph(fmt_br(registro.get('Custo Reembolsos', 0.0)), td_style)],
+            [Paragraph("<b>LUCRO LÍQUIDO FINAL</b>", th_style), Paragraph(f"<b>{fmt_br(registro['Lucro Real'])}</b>", td_bold), Paragraph("", th_style), Paragraph("", th_style)]
+        ]
+        t4 = Table(dados_sec4, colWidths=[140, 140, 140, 140])
+        t4.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,-1), colors.HexColor("#F3E8FF")), ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor("#D8B4FE")), ('PADDING', (0,0), (-1,-1), 5)]))
+        story.append(t4)
+        story.append(Spacer(1, 12))
+
+    val_box = Table([[Paragraph(f"VALOR FINANCEIRO GLOBAL ({registro['Cliente']}):", val_title_style), Paragraph(fmt_br(registro['Faturamento Bruto']), val_num_style)]], colWidths=[360, 200])
+    val_box.setStyle(TableStyle([('BACKGROUND', (0,0), (-1,-1), colors.HexColor("#3B1B54")), ('PADDING', (0,0), (-1,-1), 10), ('VALIGN', (0,0), (-1,-1), 'MIDDLE')]))
+    story.append(val_box)
+
+    if tipo_documento == "ORCAMENTO":
+        story.append(Spacer(1, 12))
+        texto_notas = """
+        <b>⚠️ CONDIÇÕES GERAIS E CONVENÇÃO</b><br/><br/>
+        • <b>Período Operacional:</b> As diárias comerciais referem-se a uma jornada padrão por evento no período de 12hs. Prorrogações ou alterações deverão ser notificadas com antecedência de 48 horas.<br/>
+        • <b>Faturamento & Compliance:</b> Pagamentos deverão ser realizados preferencialmente de forma antecipada à data dos eventos. As Notas Fiscais serão emitidas conforme os dados cadastrados.
+        """
+        t_notas = Table([[Paragraph(texto_notas, nota_text_style)]], colWidths=[560])
+        t_notas.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,-1), colors.HexColor("#F3E8FF")),
+            ('GRID', (0,0), (-1,-1), 0.5, colors.HexColor("#D8B4FE")),
+            ('PADDING', (0,0), (-1,-1), 8)
+        ]))
+        story.append(t_notas)
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer
+
+# --- CONFIGURAÇÃO DA PÁGINA STREAMLIT (IDENTIDADE ANTONIO CARLOS / NEON DARK) ---
+st.set_page_config(
+    page_title="Antonio Carlos - Gestão Financeira e Produção",
+    page_icon="⚡",
+    layout="wide"
+)
+
+st.markdown("""
+    <style>
+    .stApp { background-color: #0B0710; color: #FAF6EE; }
+    .stExpander { background-color: #1A1025 !important; border: 1px solid #D8B4FE !important; border-radius: 8px; }
+    input, textarea, select, div[role="combobox"] { color: #FAF6EE !important; background-color: #1A1025 !important; -webkit-text-fill-color: #FAF6EE !important; }
+    div[data-baseweb="input"], div[data-baseweb="textarea"], div[data-baseweb="select"] { background-color: #1A1025 !important; border: 1px solid #D8B4FE !important; border-radius: 6px !important; }
+    ::placeholder { color: #A899B5 !important; opacity: 0.8 !important; }
+    .stButton>button { background: linear-gradient(135deg, #A855F7 0%, #EC4899 100%); color: #FFFFFF !important; font-weight: bold; border-radius: 8px; border: none; padding: 0.6rem 1rem; transition: all 0.3s ease; }
+    .stButton>button:hover { background: linear-gradient(135deg, #00E676 0%, #00C853 100%); color: #0B0710 !important; box-shadow: 0 0 15px rgba(0, 230, 118, 0.5); }
+    div[data-testid="stMetricValue"] { color: #FF77FF !important; font-weight: bold; }
+    label, p, span { color: #FAF6EE !important; }
+    h1, h2, h3 { color: #D8B4FE !important; }
+    </style>
+""", unsafe_allow_html=True)
+
+# CABEÇALHO PERSONALIZADO ANTONIO CARLOS
+col_logo, col_tit = st.columns([1.5, 3.5])
+with col_logo:
+    if os.path.exists("logo.jpg"):
+        st.image("logo.jpg", use_container_width=True)
+    elif os.path.exists("logo.png"):
+        st.image("logo.png", use_container_width=True)
+    else:
+        st.markdown('<div style="background-color: #1A1025; padding: 15px; border-radius: 10px; border: 2px solid #D8B4FE; text-align: center;"><h2 style="color: #FF77FF; margin: 0; font-weight: 900;">AC</h2><span style="color: #00E676; font-size: 11px; font-weight: bold;">ANTONIO CARLOS<br>SOLUTIONS & MEDIA</span></div>', unsafe_allow_html=True)
+
+with col_tit:
+    st.title("ANTONIO CARLOS")
+    st.subheader("Painel de Controle Financeiro, Projetos e Produção")
+
+st.markdown("---")
+
+faturamentos = carregar_eventos()
+
+# --- PAINEL GERAL DE INDICADORES (SEPARADO APROVADOS X PENDENTES) ---
+if faturamentos:
+    df_kpi_raw = pd.DataFrame(faturamentos)
+    clientes_unicos = sorted(list(set(df_kpi_raw["Cliente"].dropna().tolist())))
+    opcoes_filtro_cliente = ["Todos os Clientes (Consolidado Geral)"] + clientes_unicos
+    
+    st.markdown("## 📊 Controle Financeiro por Cliente e Status")
+    
+    col_flt1, col_flt2 = st.columns(2)
+    with col_flt1:
+        cliente_selecionado_kpi = st.selectbox("🔍 Selecione o Cliente para filtrar:", opcoes_filtro_cliente)
+    with col_flt2:
+        status_selecionado_kpi = st.selectbox("📌 Selecione o Status da O.S.:", ["Todos os Status", "Pendente", "Aprovado", "Rejeitado"])
+    
+    df_kpi = df_kpi_raw.copy()
+    
+    if cliente_selecionado_kpi != "Todos os Clientes (Consolidado Geral)":
+        df_kpi = df_kpi[df_kpi["Cliente"] == cliente_selecionado_kpi]
+        
+    if status_selecionado_kpi != "Todos os Status":
+        df_kpi = df_kpi[df_kpi["Status"] == status_selecionado_kpi]
+
+    lbl_contexto = f"Cliente: {cliente_selecionado_kpi} | Status: {status_selecionado_kpi}"
+
+    df_aprovados = df_kpi[df_kpi["Status"] == "Aprovado"]
+    df_pendentes = df_kpi[df_kpi["Status"] == "Pendente"]
+
+    total_faturado_aprovado = safe_float(df_aprovados["Faturamento Bruto"].sum())
+    total_faturado_pendente = safe_float(df_pendentes["Faturamento Bruto"].sum())
+    total_faturado_geral = safe_float(df_kpi["Faturamento Bruto"].sum())
+
+    total_custos_equipe = safe_float(df_kpi["Custos Operacionais + Logística"].sum())
+    total_impostos = safe_float(df_kpi["10% NF"].sum())
+    
+    total_recebido = safe_float(df_kpi["Valor Recebido Cliente"].sum())
+    total_falta_receber = total_faturado_geral - total_recebido
+    
+    total_pago_equipe = safe_float(df_kpi["Valor Pago Equipe"].sum())
+    total_falta_pagar_equipe = total_custos_equipe - total_pago_equipe
+    
+    lucro_liquido_total = safe_float(df_kpi["Lucro Real"].sum())
+
+    st.caption(f"Exibindo dados de: **{lbl_contexto}** ({len(df_kpi)} evento(s) encontrado(s))")
+
+    kpi_col1, kpi_col2, kpi_col3, kpi_col4 = st.columns(4)
+    kpi_col1.metric("🟢 Faturado (Aprovado)", fmt_br(total_faturado_aprovado))
+    kpi_col2.metric("🟡 Em Negociação (Pendente)", fmt_br(total_faturado_pendente))
+    kpi_col3.metric("✅ Total Recebido (Cliente)", fmt_br(total_recebido))
+    kpi_col4.metric("📈 Lucro Líquido Real", fmt_br(lucro_liquido_total))
+
+    kpi_col5, kpi_col6, kpi_col7, kpi_col8 = st.columns(4)
+    kpi_col5.metric("👥 Custo Total Operacional", fmt_br(total_custos_equipe))
+    kpi_col6.metric("💸 Total Já Pago (Equipe/Ext)", fmt_br(total_pago_equipe))
+    kpi_col7.metric("⚠️ A Pagar Pessoas/Serviços", fmt_br(total_falta_pagar_equipe))
+    kpi_col8.metric("🧾 Impostos Reservados (10% NF)", fmt_br(total_impostos))
+
+    st.markdown("---")
+
+aba1, aba2, aba3, aba4, aba5, aba6, aba7 = st.tabs([
+    "➕ Novo Evento",
+    "✏️ Baixas & Edição",
+    "🗓️ Calendário",
+    "🧾 Recibos & Comprovantes",
+    "📊 Dashboards & Margens",
+    "📲 WhatsApp Rápido",
+    "📄 Relatórios & PDFs"
+])
+
+# ABA 1: NOVO EVENTO
+with aba1:
+    with st.expander("➕ Cadastrar Novo Evento e Valores", expanded=True):
+        st.markdown("### 📋 1. Identificação do Evento")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            cliente = st.text_input("Cliente / Empresa", placeholder="Digite o nome do cliente/empresa...")
+            data_evento = st.date_input("Data do Evento", datetime.now())
+            horario = st.text_input("Horário do Evento", value="08h às 18h")
+        with col2:
+            complexo_local = st.text_input("Local / Espaço do Evento", placeholder="Ex: Arena, Rooftop...")
+            data_montagem = st.date_input("Data da Montagem", datetime.now())
+            horario_montagem = st.text_input("Horário da Montagem", value="06h às 10h")
+        with col3:
+            equipe_tecnica = st.text_area("Descrição da Equipe Escalada (Uso Interno)", placeholder="Ex: 1 Tech Resolume, 1 Iluminação...")
+            status_inicial = st.selectbox("📌 Status Inicial do Orçamento / O.S.:", ["Pendente", "Aprovado", "Rejeitado"])
+
+        st.markdown("### 📄 Faturamento & Nota Fiscal para o Cliente")
+        nf_col1, nf_col2 = st.columns(2)
+        with nf_col1:
+            numero_nf = st.text_input("Número da Nota Fiscal (NF) Emitida", placeholder="Ex: 000142")
+        with nf_col2:
+            valor_nf = st.number_input("Valor da NF Emitida (R$)", min_value=0.0, step=100.0)
+
+        st.markdown("### 🛠️ 2. Equipamentos Contratados")
+        equipamentos_contrato = st.text_area("Equipamentos em Contrato", placeholder="Ex: Painéis LED, Processadores...")
+
+        st.markdown("### ➕ 3. Adicionais e Extras")
+        df_extras_init = pd.DataFrame([{"Descrição": "", "Valor": 0.0}])
+        df_extras_edit = st.data_editor(
+            df_extras_init, num_rows="dynamic", use_container_width=True,
+            column_config={
+                "Descrição": st.column_config.TextColumn("Descrição do Item Extra", required=True),
+                "Valor": st.column_config.NumberColumn("Valor (R$)", format="R$ %.2f", min_value=0.0, step=50.0)
+            }, key="editor_extras_novo"
+        )
+        val_extra_total = safe_float(df_extras_edit["Valor"].sum()) if not df_extras_edit.empty else 0.0
+
+        st.markdown("### 💸 4. Reembolsos, Despesas Operacionais e Comprovantes (Ex: Roteador, Peças)")
+        df_reemb_init = pd.DataFrame([{"Favorecido": "", "Descrição / Comprovante": "", "Valor": 0.0}])
+        df_reemb_edit = st.data_editor(
+            df_reemb_init, num_rows="dynamic", use_container_width=True,
+            column_config={
+                "Favorecido": st.column_config.TextColumn("Quem gastou / Fornecedor", required=True),
+                "Descrição / Comprovante": st.column_config.TextColumn("Detalhe (Ex: Compra de Roteador Wi-Fi, Uber)", required=True),
+                "Valor": st.column_config.NumberColumn("Valor (R$)", format="R$ %.2f", min_value=0.0, step=10.0)
+            }, key="editor_reembolsos_novo"
+        )
+        val_reembolso_total = safe_float(df_reemb_edit["Valor"].sum()) if not df_reemb_edit.empty else 0.0
+
+        st.markdown("### 💰 5. Faturamento & Negociação Fiscal")
+        col_v1, col_v2, col_v3 = st.columns(3)
+        with col_v1:
+            val_aprovado = st.number_input("Valor Base Aprovado (R$)", min_value=0.0, step=100.0)
+        with col_v2:
+            resp_imposto = st.selectbox("Imposto Nota Fiscal (10% NF):", ["Incluso no Valor", "Por Conta do Cliente", "Isento / Não Aplicável"])
+        
+        base_e_extra = val_aprovado + val_extra_total
+        if resp_imposto == "Por Conta do Cliente":
+            imposto_nf_calc = base_e_extra * 0.10
+            faturamento_bruto_calc = base_e_extra + imposto_nf_calc
+        elif resp_imposto == "Incluso no Valor":
+            imposto_nf_calc = base_e_extra * 0.10
+            faturamento_bruto_calc = base_e_extra
+        else:
+            imposto_nf_calc = 0.0
+            faturamento_bruto_calc = base_e_extra
+
+        with col_v3:
+            st.success(f"**Faturamento Bruto Final:** {fmt_br(faturamento_bruto_calc)}\n• Base: {fmt_br(val_aprovado)} | Extras: {fmt_br(val_extra_total)}\n• Imposto (10% NF): {fmt_br(imposto_nf_calc)} ({resp_imposto})")
+
+        st.markdown("### 👥 6. Custos: Equipe Técnica, Logística & Fornecedores")
+        col_c1, col_c2, col_c3, col_c4, col_c5 = st.columns(5)
+        with col_c1: custo_resolume = st.number_input("Técnico Resolume (R$)", min_value=0.0, step=50.0)
+        with col_c2: custo_iluminacao = st.number_input("Técnico Iluminação (R$)", min_value=0.0, step=50.0)
+        with col_c3: custo_sonorizacao = st.number_input("Técnico Som (R$)", min_value=0.0, step=50.0)
+        with col_c4: custo_diretor = st.number_input("Direção Técnica (R$)", min_value=0.0, step=50.0)
+        with col_c5: custo_logistica = st.number_input("Logística / Frete (R$)", min_value=0.0, step=20.0)
+
+        st.markdown("#### 🌐 Fornecedores Externos")
+        df_forn_init = pd.DataFrame([{"Descrição": "", "Valor": 0.0}])
+        df_forn_edit = st.data_editor(
+            df_forn_init, num_rows="dynamic", use_container_width=True,
+            column_config={
+                "Descrição": st.column_config.TextColumn("Descrição / Nome do Fornecedor", required=True),
+                "Valor": st.column_config.NumberColumn("Valor (R$)", format="R$ %.2f", min_value=0.0, step=50.0)
+            }, key="editor_fornecedores_novo"
+        )
+        
+        fornecedores_externos_novo = df_forn_edit.to_dict('records') if not df_forn_edit.empty else []
+        custo_externo_total = safe_float(df_forn_edit["Valor"].sum()) if not df_forn_edit.empty else 0.0
+        desc_externo_concat = ", ".join([str(f.get("Descrição", "")) for f in fornecedores_externos_novo if f.get("Descrição")])
+
+        st.markdown("### 💳 7. Status Inicial de Caixa")
+        col_st1, col_st2 = st.columns(2)
+        with col_st1:
+            val_recebido_init = st.number_input("Quanto o cliente JÁ PAGOU inicial? (R$)", min_value=0.0, step=100.0, key="v_rec_init")
+        with col_st2:
+            val_pago_equipe_init = st.number_input("Quanto você JÁ PAGOU à equipe inicial? (R$)", min_value=0.0, step=100.0, key="v_pag_init")
+
+        hist_rec_novo = [{"Data": datetime.now().strftime("%d/%m/%Y"), "Valor": val_recebido_init, "Forma": "Sinal / Inicial", "Obs": "Lançamento de Cadastro"}] if val_recebido_init > 0 else []
+        hist_pag_novo = [{"Data": datetime.now().strftime("%d/%m/%Y"), "Favorecido": "Equipe / Diversos", "Valor": val_pago_equipe_init, "Obs": "Adiantamento de Cadastro"}] if val_pago_equipe_init > 0 else []
+
+        col_d1, col_d2 = st.columns(2)
+        with col_d1: dt_pag_operacional = st.date_input("Previsão Pagamento Operacional")
+        with col_d2: dt_rec_champions = st.date_input("Previsão Recebimento Cliente")
+
+        obs_gerais = st.text_area("Observações Financeiras / Gerais")
+
+        reembolsos_novo = df_reemb_edit.to_dict('records') if not df_reemb_edit.empty else []
+        total_custos_op = custo_resolume + custo_iluminacao + custo_sonorizacao + custo_diretor + custo_logistica + custo_externo_total + val_reembolso_total
+        
+        if resp_imposto == "Por Conta do Cliente":
+            lucro_real = (faturamento_bruto_calc - imposto_nf_calc) - imposto_nf_calc - total_custos_op
+        else:
+            lucro_real = faturamento_bruto_calc - imposto_nf_calc - total_custos_op
+
+        st_rec = "Pago Total" if val_recebido_init >= faturamento_bruto_calc and faturamento_bruto_calc > 0 else ("Parcial" if val_recebido_init > 0 else "Pendente")
+        st_pag = "Pago Total" if val_pago_equipe_init >= total_custos_op and total_custos_op > 0 else ("Parcial" if val_pago_equipe_init > 0 else "Pendente")
+
+        st.markdown("---")
+        if st.button("💾 Gravar Evento no Controle Financeiro", use_container_width=True):
+            novo_registro = {
+                "Cliente": cliente if cliente else "Não informado",
+                "Data Evento": data_evento.strftime("%d/%m/%Y"),
+                "Horário": horario,
+                "Data Montagem": data_montagem.strftime("%d/%m/%Y"),
+                "Horário Montagem": horario_montagem,
+                "Complexo / Local": complexo_local if complexo_local else "Não informado",
+                "Aprovado": val_aprovado,
+                "Val. Extra": val_extra_total,
+                "Itens Extras": df_extras_edit.to_dict('records') if not df_extras_edit.empty else [],
+                "Faturamento Bruto": faturamento_bruto_calc,
+                "10% NF": imposto_nf_calc,
+                "Responsável Imposto": resp_imposto,
+                "Custos Operacionais + Logística": total_custos_op,
+                "Custo Resolume": custo_resolume,
+                "Custo Iluminação": custo_iluminacao,
+                "Custo Sonorização": custo_sonorizacao,
+                "Custo Diretor": custo_diretor,
+                "Custo Logística": custo_logistica,
+                "Custo Fornecedor Externo": custo_externo_total,
+                "Desc. Fornecedor Externo": desc_externo_concat,
+                "Fornecedores Externos": fornecedores_externos_novo,
+                "Reembolsos": reembolsos_novo,
+                "Historico Recebimentos": hist_rec_novo,
+                "Historico Pagamentos": hist_pag_novo,
+                "Custo Reembolsos": val_reembolso_total,
+                "Valor Recebido Cliente": val_recebido_init,
+                "Valor Pago Equipe": val_pago_equipe_init,
+                "Status Recebimento": st_rec,
+                "Status Pagamento": st_pag,
+                "Status": status_inicial,
+                "Numero NF": numero_nf,
+                "Valor NF": valor_nf,
+                "Lucro Real": lucro_real,
+                "Pag. Operacional": dt_pag_operacional.strftime("%d/%m/%Y"),
+                "Rec. Champions": dt_rec_champions.strftime("%d/%m/%Y"),
+                "Equipamentos": equipamentos_contrato if equipamentos_contrato else "Não especificado",
+                "Equipe Técnica": equipe_tecnica if equipe_tecnica else "Não especificado",
+                "Observações": obs_gerais if obs_gerais else "Nenhuma observação."
+            }
+            salvar_evento_db(novo_registro)
+            st.success("✅ Evento cadastrado com sucesso no Supabase!")
+            st.rerun()
+
+# ABA 2: EDITAR COMPLETO, REEMBOLSOS E BAIXAS PARCIAIS
+with aba2:
+    st.subheader("✏️ Edição Completa, Baixas Parciais & Extrato de Caixa")
+    if not faturamentos:
+        st.info("Nenhum evento registrado no banco de dados.")
+    else:
+        idx_edit = st.selectbox(
+            "Selecione o Evento para Gestão Financeira:", range(len(faturamentos)),
+            format_func=lambda x: f"ID #{faturamentos[x]['id']} - [{faturamentos[x].get('Status', 'Pendente')}] {faturamentos[x]['Cliente']} ({faturamentos[x]['Data Evento']})"
+        )
+        
+        reg = faturamentos[idx_edit]
+        
+        with st.form(f"form_edicao_completa_{reg['id']}"):
+            st.markdown(f"### 📍 Gerenciando Evento ID #{reg['id']} - {reg['Cliente']}")
+            
+            st.markdown("#### 📋 1. Identificação do Evento")
+            ce_col1, ce_col2, ce_col3 = st.columns(3)
+            with ce_col1:
+                e_cliente = st.text_input("Cliente / Empresa", value=reg["Cliente"])
+                try:
+                    dt_parsed = datetime.strptime(reg["Data Evento"], "%d/%m/%Y").date()
+                except Exception:
+                    dt_parsed = datetime.now().date()
+                e_data_evento = st.date_input("Data do Evento", value=dt_parsed)
+                e_horario = st.text_input("Horário do Evento", value=reg["Horário"])
+
+            with ce_col2:
+                e_complexo_local = st.text_input("Local / Espaço do Evento", value=reg["Complexo / Local"])
+                try:
+                    dt_mont_parsed = datetime.strptime(reg["Data Montagem"], "%d/%m/%Y").date() if reg["Data Montagem"] else datetime.now().date()
+                except Exception:
+                    dt_mont_parsed = datetime.now().date()
+                e_data_montagem = st.date_input("Data da Montagem", value=dt_mont_parsed)
+                e_horario_montagem = st.text_input("Horário da Montagem", value=reg["Horário Montagem"])
+
+            with ce_col3:
+                e_equipe_tecnica = st.text_area("Descrição da Equipe Escalada (Uso Interno)", value=reg["Equipe Técnica"])
+                
+                opcoes_status = ["Pendente", "Aprovado", "Rejeitado"]
+                status_atual_reg = reg.get("Status", "Pendente")
+                idx_st = opcoes_status.index(status_atual_reg) if status_atual_reg in opcoes_status else 0
+                e_status = st.selectbox("📌 Status do Orçamento / O.S.:", opcoes_status, index=idx_st)
+
+            st.markdown("#### 📄 Nota Fiscal Emitida para o Cliente")
+            enf_col1, enf_col2 = st.columns(2)
+            with enf_col1:
+                e_numero_nf = st.text_input("Número da Nota Fiscal", value=reg.get("Numero NF", ""))
+            with enf_col2:
+                e_valor_nf = st.number_input("Valor da Nota Fiscal (R$)", value=safe_float(reg.get("Valor NF", 0.0)), min_value=0.0, step=100.0)
+
+            st.markdown("#### 🛠️ 2. Equipamentos Contratados")
+            e_equipamentos = st.text_area("Equipamentos em Contrato", value=reg["Equipamentos"])
+
+            st.markdown("#### ➕ 3. Itens e Serviços Extras")
+            extras_existentes = reg.get("Itens Extras", [])
+            df_extras_edit_existing = pd.DataFrame(extras_existentes if extras_existentes else [{"Descrição": "", "Valor": 0.0}])
+            df_extras_updated = st.data_editor(
+                df_extras_edit_existing, num_rows="dynamic", use_container_width=True,
+                column_config={
+                    "Descrição": st.column_config.TextColumn("Descrição do Item Extra", required=True),
+                    "Valor": st.column_config.NumberColumn("Valor (R$)", format="R$ %.2f", min_value=0.0, step=50.0)
+                }, key=f"editor_extras_edit_{reg['id']}"
+            )
+            e_val_extra_total = safe_float(df_extras_updated["Valor"].sum()) if not df_extras_updated.empty else 0.0
+
+            st.markdown("#### 💸 4. Reembolsos, Despesas Operacionais e Comprovantes (Ex: Roteador, Peças)")
+            reemb_existentes = reg.get("Reembolsos", [])
+            df_reemb_edit_existing = pd.DataFrame(reemb_existentes if reemb_existentes else [{"Favorecido": "", "Descrição / Comprovante": "", "Valor": 0.0}])
+            df_reemb_updated = st.data_editor(
+                df_reemb_edit_existing, num_rows="dynamic", use_container_width=True,
+                column_config={
+                    "Favorecido": st.column_config.TextColumn("Quem gastou / Fornecedor", required=True),
+                    "Descrição / Comprovante": st.column_config.TextColumn("Detalhe (Ex: Compra de Roteador Wi-Fi, Uber)", required=True),
+                    "Valor": st.column_config.NumberColumn("Valor (R$)", format="R$ %.2f", min_value=0.0, step=10.0)
+                }, key=f"editor_reemb_edit_{reg['id']}"
+            )
+            e_val_reemb_total = safe_float(df_reemb_updated["Valor"].sum()) if not df_reemb_updated.empty else 0.0
+
+            st.markdown("#### 💰 5. Faturamento & Negociação Fiscal")
+            col_ev1, col_ev2, col_ev3 = st.columns(3)
+            with col_ev1:
+                e_val_aprovado = st.number_input("Valor Base Aprovado (R$)", value=safe_float(reg["Aprovado"]), min_value=0.0, step=100.0)
+            
+            opcoes_resp = ["Incluso no Valor", "Por Conta do Cliente", "Isento / Não Aplicável"]
+            resp_atual = reg.get("Responsável Imposto", "Incluso no Valor")
+            idx_resp = opcoes_resp.index(resp_atual) if resp_atual in opcoes_resp else 0
+            
+            with col_ev2:
+                e_resp_imposto = st.selectbox("Imposto Nota Fiscal (10% NF):", opcoes_resp, index=idx_resp)
+
+            e_base_e_extra = e_val_aprovado + e_val_extra_total
+            if e_resp_imposto == "Por Conta do Cliente":
+                e_imposto_nf_calc = e_base_e_extra * 0.10
+                e_fat_bruto_calc = e_base_e_extra + e_imposto_nf_calc
+            elif e_resp_imposto == "Incluso no Valor":
+                e_imposto_nf_calc = e_base_e_extra * 0.10
+                e_fat_bruto_calc = e_base_e_extra
+            else:
+                e_imposto_nf_calc = 0.0
+                e_fat_bruto_calc = e_base_e_extra
+
+            with col_ev3:
+                st.info(f"Faturamento Bruto Total: **{fmt_br(e_fat_bruto_calc)}**\n• NF: {fmt_br(e_imposto_nf_calc)} ({e_resp_imposto})")
+
+            st.markdown("#### 👥 6. Custos: Equipe Técnica, Logística & Cachês")
+            col_ep1, col_ep2, col_ep3, col_ep4, col_ep5 = st.columns(5)
+            with col_ep1: e_resolume = st.number_input("Resolume (R$)", value=safe_float(reg["Custo Resolume"]))
+            with col_ep2: e_iluminacao = st.number_input("Iluminação (R$)", value=safe_float(reg["Custo Iluminação"]))
+            with col_ep3: e_sonorizacao = st.number_input("Som (R$)", value=safe_float(reg["Custo Sonorização"]))
+            with col_ep4: e_diretor = st.number_input("Diretor (R$)", value=safe_float(reg["Custo Diretor"]))
+            with col_ep5: e_logistica = st.number_input("Logística (R$)", value=safe_float(reg["Custo Logística"]))
+
+            st.markdown("#### 🌐 Fornecedores Externos")
+            forn_existentes = reg.get("Fornecedores Externos", [])
+            if not forn_existentes:
+                forn_existentes = [{"Descrição": reg.get("Desc. Fornecedor Externo", ""), "Valor": safe_float(reg.get("Custo Fornecedor Externo", 0.0))}]
+            
+            df_forn_edit_existing = pd.DataFrame(forn_existentes)
+            df_forn_updated = st.data_editor(
+                df_forn_edit_existing, num_rows="dynamic", use_container_width=True,
+                column_config={
+                    "Descrição": st.column_config.TextColumn("Descrição / Nome do Fornecedor", required=True),
+                    "Valor": st.column_config.NumberColumn("Valor (R$)", format="R$ %.2f", min_value=0.0, step=50.0)
+                }, key=f"editor_forn_edit_{reg['id']}"
+            )
+
+            st.markdown("---")
+            st.markdown("#### 💳 7. Extrato e Lançamentos de Recebimentos Parciais (Cliente)")
+            
+            hist_rec_existente = reg.get("Historico Recebimentos", [])
+            df_hist_rec = pd.DataFrame(hist_rec_existente if hist_rec_existente else [{"Data": datetime.now().strftime("%d/%m/%Y"), "Valor": safe_float(reg.get("Valor Recebido Cliente")), "Forma": "Pix", "Obs": "Entrada Inicial"}])
+            
+            df_hist_rec_updated = st.data_editor(
+                df_hist_rec, num_rows="dynamic", use_container_width=True,
+                column_config={
+                    "Data": st.column_config.TextColumn("Data Pagamento", required=True),
+                    "Valor": st.column_config.NumberColumn("Valor Pago (R$)", format="R$ %.2f", min_value=0.0, step=100.0),
+                    "Forma": st.column_config.SelectboxColumn("Forma de Pagamento", options=["Pix", "Transferência/TED", "Boleto", "Dinheiro", "Outro"]),
+                    "Obs": st.column_config.TextColumn("Observações / Comprovante")
+                }, key=f"editor_hist_rec_{reg['id']}"
+            )
+            
+            total_rec_calculado = safe_float(df_hist_rec_updated["Valor"].sum()) if not df_hist_rec_updated.empty else 0.0
+            falta_receber_calc = e_fat_bruto_calc - total_rec_calculado
+            
+            st.warning(f"**Situação de Caixa (Cliente):** Total Faturado: **{fmt_br(e_fat_bruto_calc)}** | Já Recebido: **{fmt_br(total_rec_calculado)}** | ⏳ **FALTA RECEBER: {fmt_br(falta_receber_calc)}**")
+
+            st.markdown("---")
+            st.markdown("#### 💸 8. Extrato e Lançamentos de Pagamentos Parciais (Equipe / Fornecedores / Reembolsos)")
+            
+            hist_pag_existente = reg.get("Historico Pagamentos", [])
+            df_hist_pag = pd.DataFrame(hist_pag_existente if hist_pag_existente else [{"Data": datetime.now().strftime("%d/%m/%Y"), "Favorecido": "Equipe / Reembolsos", "Valor": safe_float(reg.get("Valor Pago Equipe")), "Obs": "Adiantamento"}])
+            
+            df_hist_pag_updated = st.data_editor(
+                df_hist_pag, num_rows="dynamic", use_container_width=True,
+                column_config={
+                    "Data": st.column_config.TextColumn("Data Pagamento", required=True),
+                    "Favorecido": st.column_config.TextColumn("Quem Recebeu (Nome)", required=True),
+                    "Valor": st.column_config.NumberColumn("Valor Pago (R$)", format="R$ %.2f", min_value=0.0, step=50.0),
+                    "Obs": st.column_config.TextColumn("Observações / Referência")
+                }, key=f"editor_hist_pag_{reg['id']}"
+            )
+
+            forn_atualizados_list = df_forn_updated.to_dict('records') if not df_forn_updated.empty else []
+            e_externo_total = safe_float(df_forn_updated["Valor"].sum()) if not df_forn_updated.empty else 0.0
+            novos_custos_totais = e_resolume + e_iluminacao + e_sonorizacao + e_diretor + e_logistica + e_externo_total + e_val_reemb_total
+
+            total_pago_calculado = safe_float(df_hist_pag_updated["Valor"].sum()) if not df_hist_pag_updated.empty else 0.0
+            falta_pagar_calc = novos_custos_totais - total_pago_calculado
+
+            st.warning(f"**Situação de Caixa (Equipe/Fornecedores):** Total Custos: **{fmt_br(novos_custos_totais)}** | Já Pago: **{fmt_br(total_pago_calculado)}** | ⚠️ **FALTA PAGAR: {fmt_br(falta_pagar_calc)}**")
+
+            e_obs = st.text_area("Observações Gerais do Evento", value=reg["Observações"])
+
+            st.markdown("---")
+            col_btn1, col_btn2 = st.columns([3, 1])
+            with col_btn1:
+                btn_salvar_baixa = st.form_submit_button("🔄 Salvar Alterações e Histórico no Supabase", use_container_width=True)
+            with col_btn2:
+                btn_excluir_eve = st.form_submit_button("❌ Excluir Evento", use_container_width=True)
+
+            if btn_salvar_baixa:
+                e_desc_externo_concat = ", ".join([str(f.get("Descrição", "")) for f in forn_atualizados_list if f.get("Descrição")])
+                extras_atualizados_list = df_extras_updated.to_dict('records') if not df_extras_updated.empty else []
+                reemb_atualizados_list = df_reemb_updated.to_dict('records') if not df_reemb_updated.empty else []
+
+                hist_rec_updated_list = df_hist_rec_updated.to_dict('records') if not df_hist_rec_updated.empty else []
+                hist_pag_updated_list = df_hist_pag_updated.to_dict('records') if not df_hist_pag_updated.empty else []
+
+                if e_resp_imposto == "Por Conta do Cliente":
+                    novo_lucro = (e_fat_bruto_calc - e_imposto_nf_calc) - e_imposto_nf_calc - novos_custos_totais
+                else:
+                    novo_lucro = e_fat_bruto_calc - e_imposto_nf_calc - novos_custos_totais
+
+                if total_rec_calculado >= e_fat_bruto_calc and e_fat_bruto_calc > 0:
+                    st_rec = "Pago Total"
+                elif total_rec_calculado > 0:
+                    st_rec = f"Parcial (Falta {fmt_br(falta_receber_calc)})"
+                else:
+                    st_rec = "Pendente"
+
+                if total_pago_calculado >= novos_custos_totais and novos_custos_totais > 0:
+                    st_pag = "Pago Total"
+                elif total_pago_calculado > 0:
+                    st_pag = f"Parcial (Falta {fmt_br(falta_pagar_calc)})"
+                else:
+                    st_pag = "Pendente"
+
+                reg_atualizado = {
+                    "Cliente": e_cliente,
+                    "Data Evento": e_data_evento.strftime("%d/%m/%Y"),
+                    "Horário": e_horario,
+                    "Data Montagem": e_data_montagem.strftime("%d/%m/%Y"),
+                    "Horário Montagem": e_horario_montagem,
+                    "Complexo / Local": e_complexo_local,
+                    "Aprovado": e_val_aprovado,
+                    "Val. Extra": e_val_extra_total,
+                    "Itens Extras": extras_atualizados_list,
+                    "Faturamento Bruto": e_fat_bruto_calc,
+                    "10% NF": e_imposto_nf_calc,
+                    "Responsável Imposto": e_resp_imposto,
+                    "Custos Operacionais + Logística": novos_custos_totais,
+                    "Custo Resolume": e_resolume,
+                    "Custo Iluminação": e_iluminacao,
+                    "Custo Sonorização": e_sonorizacao,
+                    "Custo Diretor": e_diretor,
+                    "Custo Logística": e_logistica,
+                    "Custo Fornecedor Externo": e_externo_total,
+                    "Desc. Fornecedor Externo": e_desc_externo_concat,
+                    "Fornecedores Externos": forn_atualizados_list,
+                    "Reembolsos": reemb_atualizados_list,
+                    "Historico Recebimentos": hist_rec_updated_list,
+                    "Historico Pagamentos": hist_pag_updated_list,
+                    "Custo Reembolsos": e_val_reemb_total,
+                    "Valor Recebido Cliente": total_rec_calculado,
+                    "Valor Pago Equipe": total_pago_calculado,
+                    "Status Recebimento": st_rec,
+                    "Status Pagamento": st_pag,
+                    "Status": e_status,
+                    "Numero NF": e_numero_nf,
+                    "Valor NF": e_valor_nf,
+                    "Lucro Real": novo_lucro,
+                    "Pag. Operacional": reg["Pag. Operacional"],
+                    "Rec. Champions": reg["Rec. Champions"],
+                    "Equipamentos": e_equipamentos if e_equipamentos else "Não especificado",
+                    "Equipe Técnica": e_equipe_tecnica if e_equipe_tecnica else "Não especificado",
+                    "Observações": e_obs if e_obs else "Nenhuma observação."
+                }
+                atualizar_evento_db(reg['id'], reg_atualizado)
+                st.success("✅ Evento e Histórico atualizados com sucesso no Supabase!")
+                st.rerun()
+
+            if btn_excluir_eve:
+                deletar_evento_db(reg['id'])
+                st.warning("🗑️ Evento excluído do Supabase!")
+                st.rerun()
+
+# ABA 3: CALENDÁRIO OPERACIONAL & CRONOGRAMA
+with aba3:
+    st.subheader("🗓️ Calendário Operacional & Cronograma de Produção")
+    if not faturamentos:
+        st.info("Nenhum evento registrado no banco de dados.")
+    else:
+        df_cal = pd.DataFrame(faturamentos)
+        st.markdown("### 📋 Cronograma de Montagens e Eventos")
+        
+        df_cal_display = df_cal[["Data Montagem", "Horário Montagem", "Data Evento", "Horário", "Cliente", "Complexo / Local", "Status", "Equipe Técnica"]].copy()
+        st.dataframe(df_cal_display, use_container_width=True)
+
+# ABA 4: GERADOR DE RECIBOS DE CACHÊ / REEMBOLSO
+with aba4:
+    st.subheader("🧾 Gerador Automático de Recibos de Cachê e Reembolsos")
+    if not faturamentos:
+        st.info("Nenhum evento cadastrado para emissão de recibos.")
+    else:
+        idx_rec_evt = st.selectbox(
+            "Selecione o Evento referente ao Recibo:", range(len(faturamentos)),
+            format_func=lambda x: f"[{faturamentos[x].get('Status', 'Pendente')}] {faturamentos[x]['Cliente']} - {faturamentos[x]['Data Evento']}"
+        )
+        evt_rec = faturamentos[idx_rec_evt]
+        
+        st.markdown(f"#### Emissão para o Evento: **{evt_rec['Cliente']}** ({evt_rec['Data Evento']})")
+        
+        rec_col1, rec_col2 = st.columns(2)
+        with rec_col1:
+            rec_favorecido = st.text_input("Nome do Favorecido / Técnico / Fornecedor", placeholder="Ex: João Silva")
+            rec_valor = st.number_input("Valor do Recibo (R$)", min_value=0.0, step=50.0)
+        with rec_col2:
+            rec_descricao = st.text_area("Descrição do Serviço ou Reembolso", value="Diária de Técnico / Compra de Equipamento (Ex: Roteador)")
+
+        if st.button("📄 Gerar Recibo em PDF", use_container_width=True):
+            if not rec_favorecido or rec_valor <= 0:
+                st.error("Por favor, preencha o nome do favorecido e um valor válido.")
+            else:
+                pdf_rec_bytes = gerar_pdf_recibo(rec_favorecido, rec_valor, rec_descricao, evt_rec['Cliente'], evt_rec['Data Evento'])
+                st.download_button(
+                    f"📥 Baixar Recibo - {rec_favorecido}",
+                    data=pdf_rec_bytes,
+                    file_name=f"Recibo_{rec_favorecido.replace(' ', '_')}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True
+                )
+
+# ABA 5: DASHBOARD DE MARGENS E DESEMPENHO POR CLIENTE
+with aba5:
+    st.subheader("📊 Dashboards de Lucratividade e Margens por Cliente")
+    if not faturamentos:
+        st.info("Nenhum dado financeiro registrado para gráficos.")
+    else:
+        df_dash = pd.DataFrame(faturamentos)
+        st.markdown("### 📈 Desempenho Financeiro por Cliente")
+        df_dash_grp = df_dash.groupby("Cliente")[["Faturamento Bruto", "Custos Operacionais + Logística", "Lucro Real"]].sum()
+        st.bar_chart(df_dash_grp)
+
+        st.markdown("### 🥧 Distribuição do Faturamento por Cliente")
+        df_pie = df_dash.groupby("Cliente")["Faturamento Bruto"].sum()
+        st.dataframe(df_pie)
+
+# ABA 6: ATENDIMENTO / WHATSAPP RÁPIDO
+with aba6:
+    st.subheader("📲 Atendimento & Envio Rápido via WhatsApp")
+    if not faturamentos:
+        st.info("Nenhum evento registrado para envio.")
+    else:
+        idx_wsp = st.selectbox(
+            "Selecione o Evento para enviar o resumo ao cliente:", range(len(faturamentos)),
+            format_func=lambda x: f"[{faturamentos[x].get('Status', 'Pendente')}] {faturamentos[x]['Cliente']} - {faturamentos[x]['Data Evento']}"
+        )
+        evt_wsp = faturamentos[idx_wsp]
+        
+        wsp_num = st.text_input("Número do WhatsApp (com DDD)", placeholder="Ex: 11999998888")
+        
+        msg_padrao = f"""Olá! Segue o resumo comercial do evento para *{evt_wsp['Cliente']}*:
+
+📅 *Data do Evento:* {evt_wsp['Data Evento']} ({evt_wsp['Horário']})
+📍 *Local:* {evt_wsp['Complexo / Local']}
+📌 *Status da O.S.:* {evt_wsp.get('Status', 'Pendente')}
+💵 *Valor Global:* {fmt_br(evt_wsp['Faturamento Bruto'])}
+📄 *NF Emitida:* {evt_wsp.get('Numero NF', 'Não emitida')} ({fmt_br(safe_float(evt_wsp.get('Valor NF', 0)))})
+⏳ *Saldo Pendente:* {fmt_br(evt_wsp['Faturamento Bruto'] - evt_wsp['Valor Recebido Cliente'])}
+
+Permanecemos à disposição!
+*Antonio Carlos*"""
+
+        msg_editada = st.text_area("Mensagem Formatada:", value=msg_padrao, height=180)
+        
+        if wsp_num:
+            num_clean = "".join(filter(str.isdigit, wsp_num))
+            msg_encoded = urllib.parse.quote(msg_editada)
+            wsp_link = f"https://api.whatsapp.com/send?phone=55{num_clean}&text={msg_encoded}"
+            st.markdown(f'<a href="{wsp_link}" target="_blank" style="text-decoration:none;"><button style="background-color:#25D366; color:white; font-weight:bold; padding:10px 20px; border:none; border-radius:8px; cursor:pointer; width:100%;">💬 Abrir no WhatsApp Web</button></a>', unsafe_allow_html=True)
+
+# ABA 7: TABELA DETALHADA, RELATÓRIOS E BACKUPS EXCEL
+with aba7:
+    st.subheader("📄 Emissão de Documentos e PDFs de Orçamento")
+    if faturamentos:
+        col_sel, col_btn1, col_btn2 = st.columns([2, 1, 1])
+        with col_sel:
+            evento_idx_pdf = st.selectbox(
+                "Selecione o Evento para gerar o PDF Comercial/Interno:", range(len(faturamentos)),
+                format_func=lambda x: f"[{faturamentos[x].get('Status', 'Pendente')}] {faturamentos[x]['Cliente']} - {faturamentos[x]['Data Evento']}"
+            )
+        
+        reg_sel = faturamentos[evento_idx_pdf]
+        
+        with col_btn1:
+            pdf_orcamento = gerar_pdf_evento(reg_sel, tipo_documento="ORCAMENTO")
+            st.download_button("📄 Baixar ORÇAMENTO (Cliente)", data=pdf_orcamento, file_name=f"Orcamento_{reg_sel['Cliente']}.pdf", mime="application/pdf", use_container_width=True)
+
+        with col_btn2:
+            pdf_financeiro = gerar_pdf_evento(reg_sel, tipo_documento="FINANCEIRO")
+            st.download_button("📊 Baixar CONTROLE (Interno)", data=pdf_financeiro, file_name=f"Controle_{reg_sel['Cliente']}.pdf", mime="application/pdf", use_container_width=True)
+
+        st.markdown("---")
+        st.subheader("💾 Backup de Dados em Excel / CSV")
+        col_bkp1, col_bkp2 = st.columns(2)
+        with col_bkp1:
+            excel_bytes = gerar_excel_backup(faturamentos)
+            st.download_button(
+                "📥 Baixar Backup Completo em Excel (.xlsx)",
+                data=excel_bytes,
+                file_name=f"Backup_Eventos_Financeiro_{datetime.now().strftime('%d_%m_%Y')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
+        with col_bkp2:
+            df_csv = pd.DataFrame(faturamentos)
+            csv_data = df_csv.to_csv(index=False).encode('utf-8')
+            st.download_button(
+                "📄 Baixar Backup em CSV",
+                data=csv_data,
+                file_name=f"Backup_Eventos_{datetime.now().strftime('%d_%m_%Y')}.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+
+        st.markdown("---")
+        st.subheader("📋 Relatório Geral Financeiro Consolidado")
+        
+        df_full = pd.DataFrame(faturamentos)
+        df_full["Falta Receber (Cliente)"] = df_full["Faturamento Bruto"] - df_full["Valor Recebido Cliente"]
+        df_full["Falta Pagar (Equipe/Ext)"] = df_full["Custos Operacionais + Logística"] - df_full["Valor Pago Equipe"]
+
+        st.dataframe(
+            df_full[[
+                "id", "Cliente", "Data Evento", "Complexo / Local", "Status", "Numero NF", "Valor NF", "Aprovado", "Val. Extra", "Custo Reembolsos", "Responsável Imposto", "Faturamento Bruto", "Valor Recebido Cliente", "Falta Receber (Cliente)",
+                "Status Recebimento", "Custos Operacionais + Logística", "Desc. Fornecedor Externo", "Custo Fornecedor Externo", "Valor Pago Equipe", "Falta Pagar (Equipe/Ext)", "Status Pagamento", "Lucro Real"
+            ]],
+            use_container_width=True
+        )
